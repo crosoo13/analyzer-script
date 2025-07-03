@@ -17,6 +17,7 @@ async function main() {
   console.log('Скрипт запущен...');
   try {
     await syncAllCompanies();
+    await archiveOrphanedVacancies(); // <-- ДОБАВЛЕННЫЙ ВЫЗОВ
     await normalizeAllPending();
     await trackPositionsAndCompetitorsTransactional();
     console.log('\nСкрипт успешно завершил работу!');
@@ -157,6 +158,53 @@ async function syncVacanciesInDB(companyId, fetchedVacancies) {
     } else {
         console.log('Изменений в названиях активных вакансий не найдено.');
     }
+}
+
+// --- ШАГ 1.5: ОЧИСТКА "ОСИРОТЕВШИХ" ВАКАНСИЙ ---
+
+/**
+ * Находит и архивирует вакансии компаний, которые были удалены из профилей.
+ */
+async function archiveOrphanedVacancies() {
+  console.log('\n--- ЗАПУСК ОЧИСТКИ "ОСИРОТЕВШИХ" ВАКАНСИЙ ---');
+  
+  // 1. Получаем ID всех актуальных компаний из профилей
+  const { data: profiles, error: profilesError } = await supabase
+    .from('profiles')
+    .select('company_hh_id')
+    .not('company_hh_id', 'is', null);
+  if (profilesError) throw profilesError;
+  const validCompanyIds = new Set(profiles.map(p => p.company_hh_id));
+  console.log(`Найдено ${validCompanyIds.size} актуальных компаний в профилях.`);
+
+  // 2. Получаем ID всех компаний, у которых есть АКТИВНЫЕ вакансии в базе
+  const { data: activeVacancyCompanies, error: vacanciesError } = await supabase
+    .from('vacancies')
+    .select('company_hh_id')
+    .eq('status', 'active');
+  if (vacanciesError) throw vacanciesError;
+  const trackedCompanyIds = new Set(activeVacancyCompanies.map(v => v.company_hh_id));
+   console.log(`Найдено ${trackedCompanyIds.size} компаний с активными вакансиями в базе.`);
+
+  // 3. Находим "осиротевшие" ID
+  const orphanedCompanyIds = [...trackedCompanyIds].filter(id => !validCompanyIds.has(id));
+
+  if (orphanedCompanyIds.length > 0) {
+    console.log(`Обнаружено ${orphanedCompanyIds.length} удаленных компаний. Архивируем их вакансии...`);
+    const { error: updateError } = await supabase
+      .from('vacancies')
+      .update({ status: 'closed' })
+      .in('company_hh_id', orphanedCompanyIds)
+      .eq('status', 'active');
+
+    if (updateError) {
+      console.error('Ошибка при архивации осиротевших вакансий:', updateError.message);
+    } else {
+      console.log('Осиротевшие вакансии успешно заархивированы.');
+    }
+  } else {
+    console.log('Удаленных компаний с активными вакансиями не найдено. Очистка не требуется.');
+  }
 }
 
 // --- ШАГ 2: НОРМАЛИЗАЦИЯ НАЗВАНИЙ ЧЕРЕЗ AI ---
