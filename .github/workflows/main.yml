@@ -1,0 +1,44 @@
+# Имя вашего воркфлоу
+name: Run Analyzer Script
+
+# Условия запуска
+on:
+  # Позволяет запускать воркфлоу вручную
+  workflow_dispatch:
+
+  # Запуск по расписанию
+  schedule:
+    # Запускать каждый день в 5:00, 8:00, 11:00, 14:00 и 17:00 по Московскому времени.
+    # (Это 2, 5, 8, 11 и 14 часов по UTC)
+    - cron: '0 2,5,8,11,14 * * *'
+
+# Задачи (jobs)
+jobs:
+  run-script-job:
+    # Использовать последнюю версию Ubuntu
+    runs-on: ubuntu-latest
+
+    # Шаги выполнения
+    steps:
+      # 1. Клонирование репозитория
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Установка Node.js
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      # 3. Установка зависимостей
+      - name: Install dependencies
+        run: npm install
+
+      # 4. Запуск скрипта с передачей секретов
+      - name: Run analyzer script
+        run: node index.js
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
