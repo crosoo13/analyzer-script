@@ -1,14 +1,18 @@
 const { fetchAllVacanciesForCompany } = require('./hhService');
+const { sendGroupedNotifications } = require('./notificationService');
+const { sleep, makeRequestWithRetries } = require('./utils');
+
+const USER_AGENT = process.env.HH_USER_AGENT || 'analyzer-script/1.0';
 
 /**
- * Улучшенная версия. Синхронизирует вакансии: добавляет новые, реактивирует старые,
+ * Синхронизирует вакансии: добавляет новые (с уведомлениями), реактивирует старые,
  * закрывает отсутствующие и проверяет изменения в названиях.
  * @param {object} supabase - Клиент Supabase.
  * @param {string} companyId - ID компании на hh.ru.
  * @param {Array} fetchedVacancies - Массив вакансий, полученных с hh.ru.
  */
 async function syncVacanciesInDB(supabase, companyId, fetchedVacancies) {
-    // 1. Получаем ВСЕ вакансии компании из нашей БД, а не только активные
+    // 1. Получаем ВСЕ вакансии компании из нашей БД для дальнейшего сравнения
     const { data: allExistingVacancies, error: existingError } = await supabase
         .from('vacancies')
         .select('id, hh_vacancy_id, raw_title, status')
@@ -18,40 +22,123 @@ async function syncVacanciesInDB(supabase, companyId, fetchedVacancies) {
         throw new Error(`Ошибка получения существующих вакансий: ${existingError.message}`);
     }
 
+    // 2. Определяем, является ли синхронизация начальной (нет активных вакансий в базе)
+    const hasActiveVacanciesInDB = allExistingVacancies.some(v => v.status === 'active');
+    const isInitialSync = !hasActiveVacanciesInDB;
+
+    if (isInitialSync) {
+        console.log(`[Начальная синхронизация] для компании ${companyId}. Уведомления отключены для этой партии.`);
+    }
+
     const existingVacanciesMap = new Map(allExistingVacancies.map(v => [v.hh_vacancy_id, { id: v.id, raw_title: v.raw_title, status: v.status }]));
     const fetchedVacancyIds = new Set(fetchedVacancies.map(v => parseInt(v.id)));
 
-    // 2. Поиск абсолютно НОВЫХ вакансий для добавления (INSERT)
-    const newVacanciesToInsert = fetchedVacancies
-        .filter(v => !existingVacanciesMap.has(parseInt(v.id)))
-        .map(v => ({
-            company_hh_id: companyId,
-            hh_vacancy_id: parseInt(v.id),
-            raw_title: v.name,
-            area_name: v.area.name,
-            area_id: parseInt(v.area.id),
-            schedule_id: v.schedule.id,
-            url: v.alternate_url,
-            status: 'active',
-            published_at: v.published_at,
-            salary_from: v.salary ? v.salary.from : null,
-            salary_to: v.salary ? v.salary.to : null,
-            salary_currency: v.salary ? v.salary.currency : null,
-            salary_gross: v.salary ? v.salary.gross : null,
-        }));
+    // 3. Обработка НОВЫХ вакансий
+    const newVacanciesSummaries = fetchedVacancies.filter(v => !existingVacanciesMap.has(parseInt(v.id)));
 
-    if (newVacanciesToInsert.length > 0) {
-        console.log(`Добавление ${newVacanciesToInsert.length} новых вакансий...`);
-        const { error } = await supabase.from('vacancies').insert(newVacanciesToInsert);
-        if (error) console.error('Ошибка добавления новых вакансий:', error.message);
+    if (newVacanciesSummaries.length > 0) {
+        if (isInitialSync) {
+            // --- РЕЖИМ НАЧАЛЬНОЙ СИНХРОНИЗАЦИИ (БЕЗ УВЕДОМЛЕНИЙ) ---
+            console.log(`Добавление ${newVacanciesSummaries.length} стартовых вакансий...`);
+            const initialVacanciesToInsert = newVacanciesSummaries.map(summary => ({
+                company_hh_id: companyId,
+                hh_vacancy_id: parseInt(summary.id),
+                raw_title: summary.name,
+                area_name: summary.area.name,
+                area_id: parseInt(summary.area.id),
+                schedule_id: summary.schedule.id,
+                url: summary.alternate_url,
+                status: 'active',
+                published_at: summary.published_at,
+                salary_from: summary.salary ? summary.salary.from : null,
+                salary_to: summary.salary ? summary.salary.to : null,
+                salary_currency: summary.salary ? summary.salary.currency : null,
+                salary_gross: summary.salary ? summary.salary.gross : null,
+                show_contacts: summary.show_contacts === true,
+                key_skills: [],
+            }));
+            const { error } = await supabase.from('vacancies').insert(initialVacanciesToInsert);
+            if (error) console.error('Ошибка добавления стартовых вакансий:', error.message);
+        } else {
+            // --- СТАНДАРТНЫЙ РЕЖИМ (С УВЕДОМЛЕНИЯМИ) ---
+            console.log(`Обнаружено ${newVacanciesSummaries.length} новых вакансий. Проверка и сбор...`);
+            const vacanciesToInsert = [];
+            const flawedVacanciesForGrouping = [];
+
+            for (const summary of newVacanciesSummaries) {
+                try {
+                    const response = await makeRequestWithRetries({
+                        method: 'get',
+                        url: `https://api.hh.ru/vacancies/${summary.id}`,
+                        headers: { 'User-Agent': USER_AGENT }
+                    });
+                    const details = response.data;
+                    
+                    const fullVacancyData = {
+                        company_hh_id: companyId,
+                        hh_vacancy_id: parseInt(summary.id),
+                        raw_title: summary.name,
+                        area_name: summary.area.name,
+                        area_id: parseInt(summary.area.id),
+                        schedule_id: summary.schedule.id,
+                        url: summary.alternate_url,
+                        status: 'active',
+                        published_at: summary.published_at,
+                        salary_from: summary.salary ? summary.salary.from : null,
+                        salary_to: summary.salary ? summary.salary.to : null,
+                        salary_currency: summary.salary ? summary.salary.currency : null,
+                        salary_gross: summary.salary ? summary.salary.gross : null,
+                        show_contacts: summary.show_contacts === true,
+                        key_skills: details.key_skills.map(s => s.name),
+                    };
+                    
+                    vacanciesToInsert.push(fullVacancyData);
+
+                    // Проверяем вакансию на недостатки и собираем информацию для группового уведомления
+                    const issues = [];
+                    if (fullVacancyData.salary_from === null) {
+                        issues.push('Не указана зарплата');
+                    }
+                    if (!fullVacancyData.key_skills || fullVacancyData.key_skills.length === 0) {
+                        issues.push('Отсутствуют ключевые навыки');
+                    }
+                    if (fullVacancyData.show_contacts !== true) {
+                        issues.push('Скрыты контакты');
+                    }
+
+                    if (issues.length > 0) {
+                        flawedVacanciesForGrouping.push({
+                            raw_title: fullVacancyData.raw_title,
+                            url: fullVacancyData.url,
+                            issues: issues // Сохраняем список проблем
+                        });
+                    }
+
+                    await sleep(550); 
+                } catch (e) {
+                    console.error(`Не удалось получить детали для вакансии ${summary.id} после всех попыток. Пропускаем.`);
+                }
+            }
+            
+            // После цикла отправляем одно сгруппированное уведомление, если есть что отправлять
+            if (flawedVacanciesForGrouping.length > 0) {
+                console.log(`Собрано ${flawedVacanciesForGrouping.length} проблемных вакансий. Отправка группового уведомления...`);
+                await sendGroupedNotifications(companyId, flawedVacanciesForGrouping, supabase);
+            }
+
+            // И вставляем все новые вакансии в базу данных
+            if (vacanciesToInsert.length > 0) {
+                const { error } = await supabase.from('vacancies').insert(vacanciesToInsert);
+                if (error) console.error('Ошибка добавления новых вакансий:', error.message);
+            }
+        }
     } else {
         console.log('Новых вакансий для добавления нет.');
     }
 
-    // 3. Поиск вакансий для РЕАКТИВАЦИИ (UPDATE)
-    // Это те, что есть на hh.ru, есть у нас в базе, но имеют статус 'closed'
+    // 4. Поиск вакансий для РЕАКТИВАЦИИ
     const vacanciesToReactivateIds = allExistingVacancies
-        .filter(v => v.status === 'closed' && fetchedVacancyIds.has(v.hh_vacancy_id))
+        .filter(v => v.status !== 'active' && fetchedVacancyIds.has(v.hh_vacancy_id))
         .map(v => v.id);
 
     if (vacanciesToReactivateIds.length > 0) {
@@ -60,8 +147,7 @@ async function syncVacanciesInDB(supabase, companyId, fetchedVacancies) {
         if (error) console.error('Ошибка реактивации вакансий:', error.message);
     }
 
-    // 4. Поиск ЗАКРЫТЫХ вакансий для обновления статуса
-    // Это те, что были 'active' у нас, но их больше нет на hh.ru
+    // 5. Поиск ЗАКРЫТЫХ вакансий
     const closedVacancyIds = allExistingVacancies
         .filter(v => v.status === 'active' && !fetchedVacancyIds.has(v.hh_vacancy_id))
         .map(v => v.hh_vacancy_id);
@@ -74,18 +160,18 @@ async function syncVacanciesInDB(supabase, companyId, fetchedVacancies) {
         console.log('Активных вакансий для закрытия нет.');
     }
 
-    // 5. Проверка изменений в названии у существующих вакансий
+    // 6. Проверка изменений в названии
     const vacanciesWithChangedTitle = [];
     for (const fetchedV of fetchedVacancies) {
         const hhId = parseInt(fetchedV.id);
         if (existingVacanciesMap.has(hhId)) {
             const existingV = existingVacanciesMap.get(hhId);
-            if (existingV.raw_title !== fetchedV.name) {
+            if (existingV.status === 'active' && existingV.raw_title !== fetchedV.name) {
                 console.log(` -> Название изменено: было "${existingV.raw_title}", стало "${fetchedV.name}"`);
                 vacanciesWithChangedTitle.push({
                     id: existingV.id,
                     raw_title: fetchedV.name,
-                    normalized_title: null // Сброс для повторной нормализации!
+                    normalized_title: null
                 });
             }
         }
@@ -98,16 +184,12 @@ async function syncVacanciesInDB(supabase, companyId, fetchedVacancies) {
             .update({ raw_title: v.raw_title, normalized_title: v.normalized_title })
             .eq('id', v.id)
         );
-        const results = await Promise.allSettled(updatePromises);
-        results.forEach((result, index) => {
-            if (result.status === 'rejected') {
-                console.error(`Ошибка обновления вакансии ${vacanciesWithChangedTitle[index].id}:`, result.reason.message);
-            }
-        });
+        await Promise.all(updatePromises);
     } else {
         console.log('Изменений в названиях активных вакансий не найдено.');
     }
 }
+
 
 /**
  * Находит и архивирует вакансии компаний, которые были удалены из профилей.
@@ -161,8 +243,8 @@ async function syncAllCompanies(supabase) {
     const { data: profiles, error: profilesError } = await supabase.from('profiles').select('company_hh_id').not('company_hh_id', 'is', null);
     if (profilesError) throw profilesError;
 
-    const companyIds = [...new Set(profiles.map(p => p.company_hh_id))];
-    console.log(`Найдено ${companyIds.length} уникальных компаний.`);
+    const companyIds = [...new Set(profiles.map(p => p.company_hh_id).filter(id => id))];
+    console.log(`Найдено ${companyIds.length} уникальных компаний для синхронизации.`);
 
     if (companyIds.length > 0) {
         for (const companyId of companyIds) {

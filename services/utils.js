@@ -27,13 +27,20 @@ async function makeRequestWithRetries(axiosConfig, retries = 5, baseDelay = 2000
                 console.warn(` -> Попытка ${attempt} не удалась (${error.response.status}). Повтор через ${delay / 1000} сек...`);
                 await sleep(delay);
             } else {
-                console.error(` -> Финальная ошибка после ${attempt} попыток.`, error.response ? error.response.status : error.message);
+                console.error(` -> Финальная ошибка после ${attempt} попыток для URL: ${axiosConfig.url}`);
+                if (error.response) {
+                    console.error(` -> Статус ответа: ${error.response.status}`);
+                    console.error(` -> Тело ответа:`, error.response.data);
+                } else {
+                    console.error(` -> Ошибка без ответа от сервера: ${error.message}`);
+                }
                 throw error;
             }
         }
     }
 }
 
+// Убедитесь, что обе функции экспортируются
 module.exports = {
     sleep,
     makeRequestWithRetries
