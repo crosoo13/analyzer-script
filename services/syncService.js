@@ -5,6 +5,39 @@ const { sleep, makeRequestWithRetries } = require('./utils');
 const USER_AGENT = process.env.HH_USER_AGENT || 'analyzer-script/1.0';
 
 /**
+ * Получает ВСЕ записи из таблицы Supabase, обходя ограничение в 1000 строк.
+ * @param {object} query - Начальный запрос Supabase (e.g., supabase.from('...').select('...')).
+ * @returns {Promise<Array>} - Полный массив данных.
+ */
+async function fetchAllSupabasePages(query) {
+    let allData = [];
+    let page = 0;
+    const pageSize = 1000; // Стандартный лимит Supabase на один запрос
+
+    while (true) {
+        const { data, error } = await query.range(page * pageSize, (page + 1) * pageSize - 1);
+
+        if (error) {
+            console.error("Ошибка при постраничной загрузке из Supabase:", error.message);
+            throw error;
+        }
+
+        if (data && data.length > 0) {
+            allData.push(...data);
+        }
+
+        // Если данных вернулось меньше, чем мы запрашивали, это последняя страница
+        if (!data || data.length < pageSize) {
+            break;
+        }
+
+        page++;
+    }
+    return allData;
+}
+
+
+/**
  * Синхронизирует вакансии: добавляет новые (с уведомлениями), реактивирует старые,
  * закрывает отсутствующие и проверяет изменения в названиях.
  * @param {object} supabase - Клиент Supabase.
@@ -12,15 +45,16 @@ const USER_AGENT = process.env.HH_USER_AGENT || 'analyzer-script/1.0';
  * @param {Array} fetchedVacancies - Массив вакансий, полученных с hh.ru.
  */
 async function syncVacanciesInDB(supabase, companyId, fetchedVacancies) {
-    // 1. Получаем ВСЕ вакансии компании из нашей БД для дальнейшего сравнения
-    const { data: allExistingVacancies, error: existingError } = await supabase
+    // 1. Получаем ВСЕ вакансии компании из нашей БД с помощью пагинации
+    console.log(`Получение всех существующих вакансий из БД для компании ${companyId}...`);
+    const query = supabase
         .from('vacancies')
         .select('id, hh_vacancy_id, raw_title, status')
         .eq('company_hh_id', companyId);
 
-    if (existingError) {
-        throw new Error(`Ошибка получения существующих вакансий: ${existingError.message}`);
-    }
+    const allExistingVacancies = await fetchAllSupabasePages(query);
+    console.log(`Всего в базе найдено ${allExistingVacancies.length} записей для этой компании.`);
+
 
     // 2. Определяем, является ли синхронизация начальной (нет активных вакансий в базе)
     const hasActiveVacanciesInDB = allExistingVacancies.some(v => v.status === 'active');
@@ -73,7 +107,7 @@ async function syncVacanciesInDB(supabase, companyId, fetchedVacancies) {
                         headers: { 'User-Agent': USER_AGENT }
                     });
                     const details = response.data;
-                    
+
                     const fullVacancyData = {
                         company_hh_id: companyId,
                         hh_vacancy_id: parseInt(summary.id),
@@ -91,7 +125,7 @@ async function syncVacanciesInDB(supabase, companyId, fetchedVacancies) {
                         show_contacts: summary.show_contacts === true,
                         key_skills: details.key_skills.map(s => s.name),
                     };
-                    
+
                     vacanciesToInsert.push(fullVacancyData);
 
                     // Проверяем вакансию на недостатки и собираем информацию для группового уведомления
@@ -114,12 +148,12 @@ async function syncVacanciesInDB(supabase, companyId, fetchedVacancies) {
                         });
                     }
 
-                    await sleep(550); 
+                    await sleep(550);
                 } catch (e) {
                     console.error(`Не удалось получить детали для вакансии ${summary.id} после всех попыток. Пропускаем.`);
                 }
             }
-            
+
             // После цикла отправляем одно сгруппированное уведомление, если есть что отправлять
             if (flawedVacanciesForGrouping.length > 0) {
                 console.log(`Собрано ${flawedVacanciesForGrouping.length} проблемных вакансий. Отправка группового уведомления...`);
