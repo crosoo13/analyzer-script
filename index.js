@@ -10,7 +10,7 @@ const { trackPositionsAndCompetitorsTransactional } = require('./services/tracki
 // --- ИНИЦИАЛИЗАЦИЯ КЛИЕНТОВ ---
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const geminiModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash-lite-preview-06-17"});
+const geminiModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash-lite" });
 
 /**
  * Главная функция, запускающая все этапы работы скрипта.
